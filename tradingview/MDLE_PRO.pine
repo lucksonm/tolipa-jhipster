@@ -1,0 +1,898 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © MDLE PRO
+//
+// ============================================================================
+//  MARKET DELIVERY & LIQUIDITY ENGINE PRO  (MDLE PRO)
+// ----------------------------------------------------------------------------
+//  An institutional, non-repainting market delivery model based on ICT / SMC
+//  principles. Tracks the Smart Money delivery cycle as a strict state machine:
+//
+//      Liquidity Build -> Liquidity Sweep -> Displacement -> OTE Retracement
+//      -> Target Delivery
+//
+//  Higher-timeframe bias (Daily + 4H) gates direction; the 1H chart is the
+//  execution timeframe for sweeps, displacement, OTE entries and targets.
+//
+//  Design notes on NON-REPAINTING:
+//   * All HTF data is requested with lookahead_off and read on confirmed bars
+//     (we deliberately use the previous completed HTF value).
+//   * State transitions, signals and confluence are evaluated on bar close
+//     (barstate.isconfirmed) so a printed signal never disappears.
+//   * Pivots use a fixed right-hand offset (they are only confirmed after N
+//     bars), which is inherently non-repainting.
+//   * Drawing objects are pooled and trimmed to respect TradingView limits.
+// ============================================================================
+
+//@version=6
+indicator("MARKET DELIVERY & LIQUIDITY ENGINE PRO (MDLE PRO)", shorttitle="MDLE PRO", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500, max_bars_back=2000)
+
+// ============================================================================
+// SECTION 0 — INPUTS / USER CONFIGURATION
+// ============================================================================
+
+// ---- General ---------------------------------------------------------------
+grpGen      = "▣ General"
+showDash    = input.bool(true,  "Show Dashboard",                       group=grpGen)
+dashPos     = input.string("Top Right", "Dashboard Position", options=["Top Right","Top Left","Bottom Right","Bottom Left","Middle Right"], group=grpGen)
+dashSize    = input.string("Normal", "Dashboard Text Size", options=["Tiny","Small","Normal","Large"], group=grpGen)
+showSignals = input.bool(true,  "Show Trade Signal Panel",              group=grpGen)
+showDraw    = input.bool(true,  "Show Chart Drawings (boxes/zones)",    group=grpGen)
+maxSetups   = input.int(8, "Max Stored Setups (cleanup)", minval=2, maxval=40, group=grpGen)
+
+// ---- Higher-Timeframe Bias --------------------------------------------------
+grpBias     = "▣ Higher-Timeframe Bias"
+htf1        = input.timeframe("D",  "HTF #1 (Bias)",  group=grpBias)
+htf2        = input.timeframe("240","HTF #2 (Bias)",  group=grpBias)
+biasLen     = input.int(20, "Bias EMA / Structure Length", minval=5, maxval=200, group=grpBias)
+biasMode    = input.string("Structure + EMA", "Bias Method", options=["Structure + EMA","EMA Only","Structure Only"], group=grpBias)
+
+// ---- Liquidity Build / Consolidation ---------------------------------------
+grpLiq      = "▣ State 1 — Liquidity Build"
+eqLen       = input.int(15, "Equal H/L Lookback (pivots)", minval=3, maxval=100, group=grpLiq)
+eqTolATR    = input.float(0.10, "Equal H/L Tolerance (× ATR)", minval=0.01, maxval=1.0, step=0.01, group=grpLiq)
+consoLen    = input.int(20, "Consolidation Window (bars)", minval=5, maxval=100, group=grpLiq)
+compressMul = input.float(0.7, "Compression Threshold (range/ATR)", minval=0.1, maxval=2.0, step=0.05, group=grpLiq)
+
+// ---- Liquidity Sweep --------------------------------------------------------
+grpSweep    = "▣ State 2 — Liquidity Sweep"
+swpPivLen   = input.int(10, "Swing Pivot Length (sweep refs)", minval=3, maxval=50, group=grpSweep)
+swpRejPct   = input.float(0.33, "Min Wick Rejection (% of range)", minval=0.1, maxval=0.9, step=0.01, group=grpSweep)
+usePDHL     = input.bool(true,  "Use Previous Day H/L",  group=grpSweep)
+usePWHL     = input.bool(true,  "Use Previous Week H/L", group=grpSweep)
+
+// ---- Displacement -----------------------------------------------------------
+grpDisp     = "▣ State 3 — Displacement"
+atrLen      = input.int(14, "ATR Length", minval=5, maxval=100, group=grpDisp)
+dispBodyMul = input.float(1.5, "Displacement Body > (× ATR)", minval=0.5, maxval=5.0, step=0.1, group=grpDisp)
+mssPivLen   = input.int(5, "MSS / BOS Pivot Length", minval=2, maxval=30, group=grpDisp)
+dispMaxBars = input.int(15, "Max Bars: Sweep → Displacement", minval=2, maxval=60, group=grpDisp)
+
+// ---- OTE / Fibonacci --------------------------------------------------------
+grpOTE      = "▣ State 4 — OTE Retracement"
+oteLow      = input.float(0.62,  "OTE Zone Lower (Fib)", minval=0.5, maxval=0.79, step=0.001, group=grpOTE)
+oteHigh     = input.float(0.79,  "OTE Zone Upper (Fib)", minval=0.62, maxval=0.9, step=0.001, group=grpOTE)
+otePrime    = input.float(0.705, "OTE Primary Level (Fib)", minval=0.5, maxval=0.9, step=0.001, group=grpOTE)
+oteMaxBars  = input.int(40, "Max Bars: Displacement → OTE Fill", minval=5, maxval=150, group=grpOTE)
+
+// ---- Confluence / Grading ---------------------------------------------------
+grpConf     = "▣ Confluence Engine"
+minScore    = input.int(80, "Minimum Confluence Score to Signal", minval=50, maxval=100, group=grpConf)
+useOB       = input.bool(true, "Require/Score Order Block", group=grpConf)
+
+// ---- Sessions ---------------------------------------------------------------
+grpSess     = "▣ Session Alignment"
+londonSess  = input.session("0700-1600", "London Session",        group=grpSess)
+nySess      = input.session("1230-2100", "New York Session",      group=grpSess)
+overlapSess = input.session("1230-1600", "London/NY Overlap",     group=grpSess)
+sessTZ      = input.string("GMT+0", "Session Timezone", group=grpSess)
+
+// ---- Risk -------------------------------------------------------------------
+grpRisk     = "▣ Risk Management"
+slBufATR    = input.float(0.25, "Stop-Loss Buffer (× ATR)", minval=0.0, maxval=2.0, step=0.05, group=grpRisk)
+tp1RR       = input.float(1.0, "TP1 Target RR", minval=0.5, maxval=5.0, step=0.1, group=grpRisk)
+tp2RR       = input.float(2.0, "TP2 Target RR", minval=0.5, maxval=10.0, step=0.1, group=grpRisk)
+tp3RR       = input.float(3.0, "TP3 Target RR", minval=1.0, maxval=20.0, step=0.1, group=grpRisk)
+
+// ---- Colors -----------------------------------------------------------------
+grpCol      = "▣ Colors"
+colBull     = input.color(color.new(#26a69a, 0),  "Bullish",       group=grpCol)
+colBear     = input.color(color.new(#ef5350, 0),  "Bearish",       group=grpCol)
+colNeutral  = input.color(color.new(#787b86, 0),  "Neutral",       group=grpCol)
+colOTEBull  = input.color(color.new(#26a69a, 80), "OTE Zone Bull", group=grpCol)
+colOTEBear  = input.color(color.new(#ef5350, 80), "OTE Zone Bear", group=grpCol)
+colFVG      = input.color(color.new(#ffb74d, 80),  "FVG",          group=grpCol)
+colConso    = input.color(color.new(#787b86, 85), "Consolidation", group=grpCol)
+
+// ============================================================================
+// SECTION 1 — CORE CALCULATIONS / HELPERS
+// ============================================================================
+
+atr      = ta.atr(atrLen)
+bodySize = math.abs(close - open)
+barRange = high - low
+
+f_txtSize(_s) =>
+    switch _s
+        "Tiny"   => size.tiny
+        "Small"  => size.small
+        "Normal" => size.normal
+        "Large"  => size.large
+        => size.normal
+
+f_dashPos(_p) =>
+    switch _p
+        "Top Right"     => position.top_right
+        "Top Left"      => position.top_left
+        "Bottom Right"  => position.bottom_right
+        "Bottom Left"   => position.bottom_left
+        "Middle Right"  => position.middle_right
+        => position.top_right
+
+// ============================================================================
+// SECTION 2 — HIGHER-TIMEFRAME BIAS (non-repainting)
+// ----------------------------------------------------------------------------
+//  We pull EMA + a simple structure read from each HTF using lookahead_off and
+//  the previous *confirmed* bar ([1]) so values never repaint intrabar.
+// ============================================================================
+
+f_htfBias(_tf) =>
+    [_ema, _h, _l, _c] = request.security(syminfo.tickerid, _tf,
+         [ta.ema(close, biasLen), ta.highest(high, biasLen), ta.lowest(low, biasLen), close],
+         lookahead = barmerge.lookahead_off)
+    // use confirmed previous HTF candle to avoid repaint
+    emaC = _ema[1]
+    cC   = _c[1]
+    emaBias = cC > emaC ? 1 : cC < emaC ? -1 : 0
+    // structure: close in upper/lower third of recent HTF range
+    rng = _h[1] - _l[1]
+    structBias = rng > 0 ? (cC > _l[1] + rng * 0.6 ? 1 : cC < _l[1] + rng * 0.4 ? -1 : 0) : 0
+    bias = biasMode == "EMA Only" ? emaBias : biasMode == "Structure Only" ? structBias : (emaBias + structBias > 0 ? 1 : emaBias + structBias < 0 ? -1 : 0)
+    bias
+
+bias1 = f_htfBias(htf1)
+bias2 = f_htfBias(htf2)
+
+// Combined HTF bias: both must agree for a directional bias, else neutral
+htfBias = (bias1 == 1 and bias2 == 1) ? 1 : (bias1 == -1 and bias2 == -1) ? -1 : 0
+htfBullish = htfBias == 1
+htfBearish = htfBias == -1
+htfBiasTxt = htfBullish ? "BULLISH" : htfBearish ? "BEARISH" : "NEUTRAL"
+
+// ============================================================================
+// SECTION 3 — REFERENCE LIQUIDITY LEVELS (PDH/PDL, PWH/PWL)
+// ============================================================================
+
+[pdh, pdl] = request.security(syminfo.tickerid, "D",  [high[1], low[1]], lookahead = barmerge.lookahead_off)
+[pwh, pwl] = request.security(syminfo.tickerid, "W",  [high[1], low[1]], lookahead = barmerge.lookahead_off)
+
+// ============================================================================
+// SECTION 4 — SWING PIVOTS & EQUAL HIGHS/LOWS
+// ============================================================================
+
+ph = ta.pivothigh(high, swpPivLen, swpPivLen)
+pl = ta.pivotlow(low,   swpPivLen, swpPivLen)
+
+// persistent last confirmed swing levels (set with the pivot's right offset → non-repaint)
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+var int   lastSwingHighBar = na
+var int   lastSwingLowBar  = na
+if not na(ph)
+    lastSwingHigh := ph
+    lastSwingHighBar := bar_index - swpPivLen
+if not na(pl)
+    lastSwingLow := pl
+    lastSwingLowBar := bar_index - swpPivLen
+
+// Equal Highs / Equal Lows detection
+eqph = ta.pivothigh(high, eqLen, eqLen)
+eqpl = ta.pivotlow(low,   eqLen, eqLen)
+var float prevEqH = na
+var float prevEqL = na
+var float eqHighLvl = na
+var float eqLowLvl  = na
+eqTol = atr * eqTolATR
+
+newEQH = false
+newEQL = false
+if not na(eqph)
+    if not na(prevEqH) and math.abs(eqph - prevEqH) <= eqTol
+        eqHighLvl := math.max(eqph, prevEqH)
+        newEQH := true
+    prevEqH := eqph
+if not na(eqpl)
+    if not na(prevEqL) and math.abs(eqpl - prevEqL) <= eqTol
+        eqLowLvl := math.min(eqpl, prevEqL)
+        newEQL := true
+    prevEqL := eqpl
+
+// ============================================================================
+// SECTION 5 — CONSOLIDATION / COMPRESSION (State 1 detector)
+// ============================================================================
+
+hiN = ta.highest(high, consoLen)
+loN = ta.lowest(low,  consoLen)
+consoRange = hiN - loN
+isCompressed = consoRange < atr * compressMul * math.sqrt(consoLen)
+equilibrium = (hiN + loN) / 2
+
+// ============================================================================
+// SECTION 6 — SESSION FLAGS
+// ============================================================================
+
+inLondon  = not na(time(timeframe.period, londonSess,  sessTZ))
+inNY       = not na(time(timeframe.period, nySess,      sessTZ))
+inOverlap = not na(time(timeframe.period, overlapSess, sessTZ))
+inKillzone = inLondon or inNY
+sessTxt = inOverlap ? "LDN/NY OVERLAP" : inLondon ? "LONDON" : inNY ? "NEW YORK" : "OFF-SESSION"
+
+// ============================================================================
+// SECTION 7 — FAIR VALUE GAP DETECTION (3-candle)
+// ============================================================================
+//  Bullish FVG: low[0] > high[2]  (gap between candle -2 high and current low)
+//  Bearish FVG: high[0] < low[2]
+// ============================================================================
+
+bullFVG = low > high[2] and close > open
+bearFVG = high < low[2] and close < open
+bullFVGtop = low
+bullFVGbot = high[2]
+bearFVGtop = low[2]
+bearFVGbot = high
+
+// ============================================================================
+// SECTION 8 — STATE MACHINE
+// ----------------------------------------------------------------------------
+//  States: 0 = CONSOLIDATION (Liquidity Build)
+//          1 = SWEEP
+//          2 = DISPLACEMENT
+//          3 = OTE (waiting for / inside retracement)
+//          4 = DELIVERY (signal active, tracking target)
+//  dir:   +1 bullish setup, -1 bearish setup, 0 none
+// ============================================================================
+
+var int   state      = 0
+var int   dir         = 0
+var int   stateBar   = 0           // bar_index when current state began
+
+// Sweep context
+var float sweepLevel  = na          // the liquidity level that was swept
+var float sweepExtreme = na         // the wick extreme of the sweep
+var int   sweepBar    = na
+var string sweepSrc   = ""
+
+// Displacement context
+var float dispHigh    = na          // expansion high (for fib anchor)
+var float dispLow     = na          // expansion low (for fib anchor)
+var int   dispBar     = na
+var float obHigh      = na          // order block high
+var float obLow       = na          // order block low
+var bool  hasFVG      = false
+
+// OTE context
+var float fibTop      = na          // 0% anchor for retracement reference
+var float fibBot      = na
+var float oteZoneHi   = na
+var float oteZoneLo   = na
+var float otePrimeLvl = na
+
+// NOTE: Pine v6 user-defined functions cannot reassign global variables, so the
+// "reset setup context" action is implemented as a deferred flag (reqReset) that
+// is applied at the end of the confirmed-bar block (see SECTION 11 footer).
+var bool reqReset = false
+
+// ---- helper: does this bar sweep a level on the given side & reject? --------
+// Bullish sweep (sell-side): wick takes out a low then closes back above it.
+f_sellSideSweep(_lvl) =>
+    bool ok = false
+    if not na(_lvl)
+        wickLow = low < _lvl and close > _lvl
+        rejection = (close - low) > barRange * swpRejPct
+        ok := wickLow and rejection
+    ok
+// Bearish sweep (buy-side): wick takes out a high then closes back below it.
+f_buySideSweep(_lvl) =>
+    bool ok = false
+    if not na(_lvl)
+        wickHigh = high > _lvl and close < _lvl
+        rejection = (high - close) > barRange * swpRejPct
+        ok := wickHigh and rejection
+    ok
+
+// Collect candidate sell-side & buy-side liquidity levels
+sslEQ  = eqLowLvl
+bslEQ  = eqHighLvl
+// nearest reference levels (only consider ones price is currently near/below-above)
+f_bestSell() =>
+    // returns [level, src] of the nearest swept sell-side level this bar
+    float lvl = na
+    string src = ""
+    if f_sellSideSweep(sslEQ)
+        lvl := sslEQ
+        src := "Equal Lows"
+    if na(lvl) and usePDHL and f_sellSideSweep(pdl)
+        lvl := pdl
+        src := "Prev Day Low"
+    if na(lvl) and usePWHL and f_sellSideSweep(pwl)
+        lvl := pwl
+        src := "Prev Week Low"
+    if na(lvl) and f_sellSideSweep(lastSwingLow)
+        lvl := lastSwingLow
+        src := "Swing Low (SSL)"
+    [lvl, src]
+
+f_bestBuy() =>
+    float lvl = na
+    string src = ""
+    if f_buySideSweep(bslEQ)
+        lvl := bslEQ
+        src := "Equal Highs"
+    if na(lvl) and usePDHL and f_buySideSweep(pdh)
+        lvl := pdh
+        src := "Prev Day High"
+    if na(lvl) and usePWHL and f_buySideSweep(pwh)
+        lvl := pwh
+        src := "Prev Week High"
+    if na(lvl) and f_buySideSweep(lastSwingHigh)
+        lvl := lastSwingHigh
+        src := "Swing High (BSL)"
+    [lvl, src]
+
+[sellLvl, sellSrc] = f_bestSell()
+[buyLvl,  buySrc]  = f_bestBuy()
+
+// ---- MSS / BOS detection ----------------------------------------------------
+// Bullish MSS: close breaks above last confirmed swing high after a sweep low.
+// Bearish MSS: close breaks below last confirmed swing low after a sweep high.
+mssUp   = not na(lastSwingHigh) and close > lastSwingHigh
+mssDown = not na(lastSwingLow)  and close < lastSwingLow
+
+// ---- Displacement candle ----------------------------------------------------
+isDispBull = bodySize > atr * dispBodyMul and close > open
+isDispBear = bodySize > atr * dispBodyMul and close < open
+
+// ============================================================================
+//  STATE TRANSITION LOGIC — evaluated on confirmed bars only (non-repaint)
+// ============================================================================
+
+var bool sweepFired = false
+var bool dispFired  = false
+var bool oteFired   = false
+
+confirmed = barstate.isconfirmed
+
+if confirmed
+    // ----- timeout / invalidations --------------------------------------
+    if state == 1 and (bar_index - stateBar) > dispMaxBars
+        state := 0
+        dir := 0
+        reqReset := true
+    // State 3 = waiting for price to retrace into the OTE zone (state 2 is
+    // transient — it advances to 3 on the same bar the fib is anchored).
+    if state == 3 and (bar_index - stateBar) > oteMaxBars
+        state := 0
+        dir := 0
+        reqReset := true
+
+    // ----- STATE 0 -> 1 : Liquidity Sweep (gated by HTF bias) -----------
+    if state == 0
+        // Bullish path requires bullish HTF + sell-side sweep
+        if htfBullish and not na(sellLvl)
+            state := 1
+            dir := 1
+            stateBar := bar_index
+            sweepLevel := sellLvl
+            sweepExtreme := low
+            sweepBar := bar_index
+            sweepSrc := sellSrc
+            sweepFired := true
+        // Bearish path requires bearish HTF + buy-side sweep
+        else if htfBearish and not na(buyLvl)
+            state := 1
+            dir := -1
+            stateBar := bar_index
+            sweepLevel := buyLvl
+            sweepExtreme := high
+            sweepBar := bar_index
+            sweepSrc := buySrc
+            sweepFired := true
+
+    // ----- STATE 1 -> 2 : Displacement + MSS + FVG ----------------------
+    else if state == 1
+        if dir == 1 and isDispBull and mssUp
+            state := 2
+            stateBar := bar_index
+            dispBar := bar_index
+            dispLow := sweepExtreme                  // expansion low = sweep wick
+            dispHigh := high
+            // order block = last down candle before displacement
+            obHigh := open[1] > close[1] ? high[1] : open[1]
+            obLow  := open[1] > close[1] ? low[1]  : close[1]
+            hasFVG := bullFVG or bullFVG[1]
+            dispFired := true
+        else if dir == -1 and isDispBear and mssDown
+            state := 2
+            stateBar := bar_index
+            dispBar := bar_index
+            dispHigh := sweepExtreme
+            dispLow := low
+            obHigh := open[1] < close[1] ? high[1] : close[1]
+            obLow  := open[1] < close[1] ? low[1]  : open[1]
+            hasFVG := bearFVG or bearFVG[1]
+            dispFired := true
+
+    // ----- STATE 2 -> 3 : Anchor Fibonacci, build OTE zone --------------
+    if state == 2 and na(oteZoneHi)
+        if dir == 1
+            // bullish: anchor low->high; retrace measured from high downward
+            fibBot := dispLow
+            fibTop := dispHigh
+            rng = fibTop - fibBot
+            oteZoneHi := fibTop - rng * oteLow       // 62% retr (higher price)
+            oteZoneLo := fibTop - rng * oteHigh      // 79% retr (lower price)
+            otePrimeLvl := fibTop - rng * otePrime   // 70.5%
+        else if dir == -1
+            fibTop := dispHigh
+            fibBot := dispLow
+            rng = fibTop - fibBot
+            oteZoneLo := fibBot + rng * oteLow       // 62% retr (lower price)
+            oteZoneHi := fibBot + rng * oteHigh      // 79% retr (higher price)
+            otePrimeLvl := fibBot + rng * otePrime
+        state := 3
+        stateBar := bar_index
+
+    // ----- STATE 3 : detect price entering OTE zone ---------------------
+    // (signal generation handled below once inside zone)
+
+// price currently inside OTE zone?
+inOTE = state == 3 and not na(oteZoneHi) and not na(oteZoneLo) and low <= oteZoneHi and high >= oteZoneLo
+
+// ---- Clean one-shot event flags for ALERTS ---------------------------------
+// (captured here, BEFORE the drawing layer consumes sweepFired/dispFired, so
+//  each is true exactly on the bar the transition is confirmed → non-repaint)
+alSweepEvt = sweepFired
+alDispEvt  = dispFired
+alOteEvt   = confirmed and inOTE and not oteFired
+if confirmed and inOTE and not oteFired
+    oteFired := true
+
+// ============================================================================
+// SECTION 9 — CONFLUENCE ENGINE (weighted scoring 0..100)
+// ============================================================================
+
+f_confluence() =>
+    int sc = 0
+    // HTF bias aligned with setup direction
+    if (dir == 1 and htfBullish) or (dir == -1 and htfBearish)
+        sc += 20
+    // Liquidity sweep present
+    if not na(sweepLevel)
+        sc += 20
+    // Displacement confirmed (we are in state >= 2)
+    if state >= 2
+        sc += 20
+    // FVG present
+    if hasFVG
+        sc += 15
+    // Order block present
+    if useOB and not na(obHigh) and not na(obLow)
+        sc += 10
+    // Inside OTE zone
+    if inOTE
+        sc += 10
+    // Session alignment
+    if inOverlap
+        sc += 5
+    else if inKillzone
+        sc += 3
+    sc
+
+confScore = f_confluence()
+
+f_grade(_s) =>
+    _s >= 90 ? "A+" : _s >= 80 ? "A" : _s >= 70 ? "B" : _s >= 50 ? "C" : "—"
+setupGrade = f_grade(confScore)
+
+// ============================================================================
+// SECTION 10 — DRAW ON LIQUIDITY (target selection & ranking)
+// ============================================================================
+//  Bullish priority: EQH -> PDH -> PWH -> Swing High -> external BSL
+//  Bearish priority: EQL -> PDL -> PWL -> Swing Low  -> external SSL
+//  We pick the nearest *unfilled* target in the direction of the trade.
+// ============================================================================
+
+f_drawOnLiquidity(_dir, _ref) =>
+    float tgt = na
+    string lbl = ""
+    if _dir == 1
+        // must be above current price
+        if not na(eqHighLvl) and eqHighLvl > _ref
+            tgt := eqHighLvl
+            lbl := "Equal Highs"
+        if (na(tgt) or (usePDHL and pdh > _ref and pdh < tgt)) and usePDHL and pdh > _ref
+            tgt := na(tgt) ? pdh : math.min(tgt, pdh)
+            lbl := "Prev Day High"
+        if na(tgt) and usePWHL and pwh > _ref
+            tgt := pwh
+            lbl := "Prev Week High"
+        if na(tgt) and not na(lastSwingHigh) and lastSwingHigh > _ref
+            tgt := lastSwingHigh
+            lbl := "Swing High (BSL)"
+    else if _dir == -1
+        if not na(eqLowLvl) and eqLowLvl < _ref
+            tgt := eqLowLvl
+            lbl := "Equal Lows"
+        if usePDHL and pdl < _ref and (na(tgt) or pdl > tgt)
+            tgt := na(tgt) ? pdl : math.max(tgt, pdl)
+            lbl := "Prev Day Low"
+        if na(tgt) and usePWHL and pwl < _ref
+            tgt := pwl
+            lbl := "Prev Week Low"
+        if na(tgt) and not na(lastSwingLow) and lastSwingLow < _ref
+            tgt := lastSwingLow
+            lbl := "Swing Low (SSL)"
+    [tgt, lbl]
+
+[dolTarget, dolLabel] = f_drawOnLiquidity(dir, close)
+distToTarget = na(dolTarget) ? na : math.abs(dolTarget - close)
+distToTargetTicks = na(distToTarget) ? na : distToTarget / syminfo.mintick
+
+// ============================================================================
+// SECTION 11 — SIGNAL GENERATION + RISK (entry / SL / TP1-3)
+// ============================================================================
+
+var bool   sigActive   = false
+var int    sigDir      = 0
+var float  entryPrice  = na
+var float  stopPrice   = na
+var float  tp1         = na
+var float  tp2         = na
+var float  tp3         = na
+var float  riskDist    = na
+var float  rrTarget    = na
+var int    sigGradeScore = 0
+var string sigGrade    = ""
+var float  sigDOL      = na
+var string sigDOLlbl   = ""
+
+// TP-hit tracking
+var bool tp1Hit = false
+var bool tp2Hit = false
+var bool tp3Hit = false
+var bool slHit  = false
+
+buySignal  = false
+sellSignal = false
+
+if confirmed and state == 3 and inOTE and confScore >= minScore and confScore >= 70 and not sigActive
+    if dir == 1 and htfBullish
+        buySignal := true
+        sigActive := true
+        sigDir := 1
+        entryPrice := close
+        // stop: lower of sweep low / OB low, minus buffer
+        slBase = na(obLow) ? sweepExtreme : math.min(sweepExtreme, obLow)
+        stopPrice := slBase - atr * slBufATR
+        riskDist := entryPrice - stopPrice
+        tp1 := entryPrice + riskDist * tp1RR
+        tp2 := entryPrice + riskDist * tp2RR
+        tp3 := entryPrice + riskDist * tp3RR
+        rrTarget := tp3RR
+        sigGradeScore := confScore
+        sigGrade := setupGrade
+        sigDOL := dolTarget
+        sigDOLlbl := dolLabel
+        tp1Hit := false
+        tp2Hit := false
+        tp3Hit := false
+        slHit := false
+        state := 4
+        stateBar := bar_index
+    else if dir == -1 and htfBearish
+        sellSignal := true
+        sigActive := true
+        sigDir := -1
+        entryPrice := close
+        slBase = na(obHigh) ? sweepExtreme : math.max(sweepExtreme, obHigh)
+        stopPrice := slBase + atr * slBufATR
+        riskDist := stopPrice - entryPrice
+        tp1 := entryPrice - riskDist * tp1RR
+        tp2 := entryPrice - riskDist * tp2RR
+        tp3 := entryPrice - riskDist * tp3RR
+        rrTarget := tp3RR
+        sigGradeScore := confScore
+        sigGrade := setupGrade
+        sigDOL := dolTarget
+        sigDOLlbl := dolLabel
+        tp1Hit := false
+        tp2Hit := false
+        tp3Hit := false
+        slHit := false
+        state := 4
+        stateBar := bar_index
+
+// ---- Manage active trade: TP / SL / completion -----------------------------
+deliveryDone = false
+if confirmed and sigActive
+    if sigDir == 1
+        if not slHit and low <= stopPrice
+            slHit := true
+            sigActive := false
+            state := 0
+            dir := 0
+            reqReset := true
+        else
+            if not tp1Hit and high >= tp1
+                tp1Hit := true
+            if not tp2Hit and high >= tp2
+                tp2Hit := true
+            if not tp3Hit and high >= tp3
+                tp3Hit := true
+                deliveryDone := true
+                sigActive := false
+                state := 0
+                dir := 0
+                reqReset := true
+    else if sigDir == -1
+        if not slHit and high >= stopPrice
+            slHit := true
+            sigActive := false
+            state := 0
+            dir := 0
+            reqReset := true
+        else
+            if not tp1Hit and low <= tp1
+                tp1Hit := true
+            if not tp2Hit and low <= tp2
+                tp2Hit := true
+            if not tp3Hit and low <= tp3
+                tp3Hit := true
+                deliveryDone := true
+                sigActive := false
+                state := 0
+                dir := 0
+                reqReset := true
+
+// ---- Apply deferred setup-context reset ------------------------------------
+// Only wipe when we are genuinely back to consolidation (state 0). If a fresh
+// setup was created on the same bar (state advanced past 0) we keep its context.
+if confirmed and reqReset and state == 0
+    sweepLevel  := na
+    sweepExtreme := na
+    sweepBar    := na
+    sweepSrc    := ""
+    dispHigh    := na
+    dispLow     := na
+    dispBar     := na
+    obHigh      := na
+    obLow       := na
+    hasFVG      := false
+    fibTop      := na
+    fibBot      := na
+    oteZoneHi   := na
+    oteZoneLo   := na
+    otePrimeLvl := na
+    reqReset    := false
+
+// realized RR (to nearest hit TP) for panel
+rrRealized = na(riskDist) or riskDist == 0 ? na : (tp3Hit ? tp3RR : tp2Hit ? tp2RR : tp1Hit ? tp1RR : 0.0)
+
+// State change detector (for alerts)
+var int prevState = 0
+stateChanged = state != prevState
+prevState := state
+
+stateTxt = state == 0 ? "CONSOLIDATION" : state == 1 ? "LIQUIDITY SWEEP" : state == 2 ? "DISPLACEMENT" : state == 3 ? "OTE RETRACEMENT" : "TARGET DELIVERY"
+
+// ============================================================================
+// SECTION 12 — CHART DRAWINGS (pooled & trimmed)
+// ============================================================================
+
+// --- Consolidation box + equilibrium (only while in state 0 & compressed) ----
+var box  consoBox = na
+var line consoEq  = na
+if showDraw and barstate.islast
+    if not na(consoBox)
+        box.delete(consoBox)
+    if not na(consoEq)
+        line.delete(consoEq)
+    if state == 0 and isCompressed
+        consoBox := box.new(bar_index - consoLen, hiN, bar_index, loN, border_color=colNeutral, bgcolor=colConso, border_style=line.style_dashed)
+        consoEq  := line.new(bar_index - consoLen, equilibrium, bar_index, equilibrium, color=colNeutral, style=line.style_dotted)
+
+// --- Equal highs / lows markers ----------------------------------------------
+if showDraw and newEQH
+    label.new(bar_index - eqLen, eqHighLvl, "EQH", style=label.style_label_down, color=color.new(colNeutral, 30), textcolor=color.white, size=size.tiny)
+if showDraw and newEQL
+    label.new(bar_index - eqLen, eqLowLvl, "EQL", style=label.style_label_up, color=color.new(colNeutral, 30), textcolor=color.white, size=size.tiny)
+
+// --- Sweep marker -------------------------------------------------------------
+if showDraw and sweepFired
+    sweepCol = dir == 1 ? colBull : colBear
+    label.new(bar_index, dir == 1 ? low : high, "SWEEP\n" + sweepSrc, style=dir == 1 ? label.style_label_up : label.style_label_down, color=color.new(sweepCol, 20), textcolor=color.white, size=size.small)
+    line.new(sweepBar, sweepLevel, bar_index, sweepLevel, color=sweepCol, style=line.style_dotted, width=1)
+sweepFired := false   // consume one-shot flag after drawing
+
+// --- Displacement / MSS / FVG -------------------------------------------------
+if showDraw and dispFired
+    dCol = dir == 1 ? colBull : colBear
+    label.new(bar_index, dir == 1 ? high : low, "DISPLACEMENT\nMSS " + (dir == 1 ? "↑" : "↓"), style=dir == 1 ? label.style_label_down : label.style_label_up, color=color.new(dCol, 10), textcolor=color.white, size=size.small)
+    // MSS / BOS line at the broken structure
+    brk = dir == 1 ? lastSwingHigh : lastSwingLow
+    if not na(brk)
+        line.new(bar_index - mssPivLen, brk, bar_index, brk, color=dCol, style=line.style_solid, width=2)
+        label.new(bar_index, brk, "MSS/BOS", style=label.style_label_left, color=color.new(dCol, 40), textcolor=color.white, size=size.tiny)
+dispFired := false
+
+// FVG boxes (drawn as they form)
+if showDraw and bullFVG
+    box.new(bar_index - 2, bullFVGtop, bar_index + 5, bullFVGbot, border_color=na, bgcolor=colFVG)
+if showDraw and bearFVG
+    box.new(bar_index - 2, bearFVGtop, bar_index + 5, bearFVGbot, border_color=na, bgcolor=colFVG)
+
+// --- OTE zone (live while in state 3 / 4) ------------------------------------
+var box oteBox = na
+var line oteLine = na
+if showDraw and barstate.islast
+    if not na(oteBox)
+        box.delete(oteBox)
+    if not na(oteLine)
+        line.delete(oteLine)
+    if (state == 3 or state == 4) and not na(oteZoneHi)
+        zc = dir == 1 ? colOTEBull : colOTEBear
+        oteBox := box.new(dispBar, oteZoneHi, bar_index + 8, oteZoneLo, border_color=color.new(dir == 1 ? colBull : colBear, 40), bgcolor=zc, text="OTE " + str.tostring(oteLow*100,"#")+"-"+str.tostring(oteHigh*100,"#")+"%", text_color=color.white, text_size=size.tiny)
+        oteLine := line.new(dispBar, otePrimeLvl, bar_index + 8, otePrimeLvl, color=dir == 1 ? colBull : colBear, style=line.style_dashed, width=1)
+
+// --- Active trade levels (entry/SL/TP) ---------------------------------------
+var line lnEntry = na
+var line lnSL    = na
+var line lnTP1   = na
+var line lnTP2   = na
+var line lnTP3   = na
+f_delLines() =>
+    line.delete(lnEntry)
+    line.delete(lnSL)
+    line.delete(lnTP1)
+    line.delete(lnTP2)
+    line.delete(lnTP3)
+
+if showDraw and barstate.islast
+    f_delLines()
+    if sigActive and not na(entryPrice)
+        lnEntry := line.new(bar_index - 1, entryPrice, bar_index + 10, entryPrice, color=color.gray, style=line.style_solid, width=1)
+        lnSL    := line.new(bar_index - 1, stopPrice, bar_index + 10, stopPrice, color=colBear, style=line.style_solid, width=1)
+        lnTP1   := line.new(bar_index - 1, tp1, bar_index + 10, tp1, color=colBull, style=line.style_dashed, width=1)
+        lnTP2   := line.new(bar_index - 1, tp2, bar_index + 10, tp2, color=colBull, style=line.style_dashed, width=1)
+        lnTP3   := line.new(bar_index - 1, tp3, bar_index + 10, tp3, color=colBull, style=line.style_dashed, width=1)
+        label.new(bar_index + 10, entryPrice, "ENTRY " + str.tostring(entryPrice, format.mintick), style=label.style_label_left, color=color.new(color.gray,20), textcolor=color.white, size=size.tiny)
+        label.new(bar_index + 10, stopPrice, "SL " + str.tostring(stopPrice, format.mintick), style=label.style_label_left, color=color.new(colBear,20), textcolor=color.white, size=size.tiny)
+        label.new(bar_index + 10, tp1, "TP1 " + str.tostring(tp1, format.mintick), style=label.style_label_left, color=color.new(colBull,20), textcolor=color.white, size=size.tiny)
+        label.new(bar_index + 10, tp2, "TP2 " + str.tostring(tp2, format.mintick), style=label.style_label_left, color=color.new(colBull,20), textcolor=color.white, size=size.tiny)
+        label.new(bar_index + 10, tp3, "TP3 " + str.tostring(tp3, format.mintick), style=label.style_label_left, color=color.new(colBull,20), textcolor=color.white, size=size.tiny)
+
+// --- BUY / SELL signal markers (permanent, non-repaint) ----------------------
+plotshape(buySignal,  title="BUY",  style=shape.labelup,   location=location.belowbar, color=colBull, textcolor=color.white, text="BUY",  size=size.normal)
+plotshape(sellSignal, title="SELL", style=shape.labeldown, location=location.abovebar, color=colBear, textcolor=color.white, text="SELL", size=size.normal)
+
+// reference level plots
+plot(usePDHL ? pdh : na, "PDH", color=color.new(color.orange, 60), style=plot.style_circles)
+plot(usePDHL ? pdl : na, "PDL", color=color.new(color.orange, 60), style=plot.style_circles)
+plot(usePWHL ? pwh : na, "PWH", color=color.new(color.purple, 60), style=plot.style_circles)
+plot(usePWHL ? pwl : na, "PWL", color=color.new(color.purple, 60), style=plot.style_circles)
+
+// ============================================================================
+// SECTION 13 — DASHBOARD
+// ============================================================================
+
+var table dash = na
+if showDash and barstate.islast
+    if not na(dash)
+        table.delete(dash)
+    dash := table.new(f_dashPos(dashPos), 2, 18, border_width=1, border_color=color.new(color.gray, 50), frame_color=color.new(color.gray,40), frame_width=1)
+    ts = f_txtSize(dashSize)
+    biasCol = htfBullish ? colBull : htfBearish ? colBear : colNeutral
+    stCol = dir == 1 ? colBull : dir == -1 ? colBear : colNeutral
+
+    table.cell(dash, 0, 0, "MDLE PRO", text_color=color.white, bgcolor=color.new(color.black, 0), text_size=ts, text_halign=text.align_center)
+    table.cell(dash, 1, 0, "1H ENGINE", text_color=color.white, bgcolor=color.new(color.black, 0), text_size=ts, text_halign=text.align_center)
+
+    table.cell(dash, 0, 1, "HTF Bias", text_color=color.gray, text_size=ts)
+    table.cell(dash, 1, 1, htfBiasTxt, text_color=color.white, bgcolor=color.new(biasCol, 60), text_size=ts)
+
+    table.cell(dash, 0, 2, "State", text_color=color.gray, text_size=ts)
+    table.cell(dash, 1, 2, stateTxt, text_color=color.white, bgcolor=color.new(stCol, 60), text_size=ts)
+
+    table.cell(dash, 0, 3, "Sweep", text_color=color.gray, text_size=ts)
+    table.cell(dash, 1, 3, na(sweepLevel) ? "—" : sweepSrc + " ✔", text_color=color.white, text_size=ts)
+
+    table.cell(dash, 0, 4, "Displacement", text_color=color.gray, text_size=ts)
+    table.cell(dash, 1, 4, state >= 2 ? "CONFIRMED ✔" : "—", text_color=state >= 2 ? colBull : color.gray, text_size=ts)
+
+    table.cell(dash, 0, 5, "OTE", text_color=color.gray, text_size=ts)
+    table.cell(dash, 1, 5, inOTE ? "INSIDE ZONE ✔" : (state == 3 ? "WAITING" : "—"), text_color=inOTE ? colBull : color.gray, text_size=ts)
+
+    table.cell(dash, 0, 6, "Confluence", text_color=color.gray, text_size=ts)
+    table.cell(dash, 1, 6, str.tostring(confScore) + " / 100", text_color=color.white, bgcolor=color.new(confScore >= 80 ? colBull : confScore >= 70 ? color.orange : colNeutral, 50), text_size=ts)
+
+    table.cell(dash, 0, 7, "Grade", text_color=color.gray, text_size=ts)
+    table.cell(dash, 1, 7, setupGrade, text_color=color.white, bgcolor=color.new(setupGrade=="A+" or setupGrade=="A" ? colBull : setupGrade=="B" ? color.orange : colNeutral, 50), text_size=ts)
+
+    table.cell(dash, 0, 8, "Entry", text_color=color.gray, text_size=ts)
+    table.cell(dash, 1, 8, sigActive ? str.tostring(entryPrice, format.mintick) : "—", text_color=color.white, text_size=ts)
+
+    table.cell(dash, 0, 9, "Stop Loss", text_color=color.gray, text_size=ts)
+    table.cell(dash, 1, 9, sigActive ? str.tostring(stopPrice, format.mintick) : "—", text_color=colBear, text_size=ts)
+
+    table.cell(dash, 0, 10, "TP1", text_color=color.gray, text_size=ts)
+    table.cell(dash, 1, 10, sigActive ? str.tostring(tp1, format.mintick) + (tp1Hit ? " ✔" : "") : "—", text_color=tp1Hit ? colBull : color.white, text_size=ts)
+
+    table.cell(dash, 0, 11, "TP2", text_color=color.gray, text_size=ts)
+    table.cell(dash, 1, 11, sigActive ? str.tostring(tp2, format.mintick) + (tp2Hit ? " ✔" : "") : "—", text_color=tp2Hit ? colBull : color.white, text_size=ts)
+
+    table.cell(dash, 0, 12, "TP3", text_color=color.gray, text_size=ts)
+    table.cell(dash, 1, 12, sigActive ? str.tostring(tp3, format.mintick) + (tp3Hit ? " ✔" : "") : "—", text_color=tp3Hit ? colBull : color.white, text_size=ts)
+
+    table.cell(dash, 0, 13, "Draw on Liquidity", text_color=color.gray, text_size=ts)
+    table.cell(dash, 1, 13, na(dolTarget) ? "—" : dolLabel, text_color=color.white, text_size=ts)
+
+    table.cell(dash, 0, 14, "Target Price", text_color=color.gray, text_size=ts)
+    table.cell(dash, 1, 14, na(dolTarget) ? "—" : str.tostring(dolTarget, format.mintick), text_color=color.white, text_size=ts)
+
+    table.cell(dash, 0, 15, "Dist to Target", text_color=color.gray, text_size=ts)
+    table.cell(dash, 1, 15, na(distToTargetTicks) ? "—" : str.tostring(distToTargetTicks, "#") + " ticks", text_color=color.white, text_size=ts)
+
+    table.cell(dash, 0, 16, "Target RR", text_color=color.gray, text_size=ts)
+    table.cell(dash, 1, 16, sigActive ? "1:" + str.tostring(rrTarget, "#.#") : "—", text_color=color.white, text_size=ts)
+
+    table.cell(dash, 0, 17, "Session", text_color=color.gray, text_size=ts)
+    table.cell(dash, 1, 17, sessTxt, text_color=color.white, bgcolor=color.new(inKillzone ? colBull : colNeutral, 60), text_size=ts)
+
+// ============================================================================
+// SECTION 14 — SIGNAL PANEL (compact, last bar, bottom-left)
+// ============================================================================
+
+var table sigPanel = na
+if showSignals and barstate.islast and sigActive
+    if not na(sigPanel)
+        table.delete(sigPanel)
+    sigPanel := table.new(position.bottom_left, 2, 10, border_width=1, border_color=color.new(color.gray,50), frame_color=color.new(color.gray,40), frame_width=1)
+    ts = f_txtSize(dashSize)
+    sc = sigDir == 1 ? colBull : colBear
+    table.cell(sigPanel, 0, 0, "SIGNAL", text_color=color.white, bgcolor=color.new(sc,0), text_size=ts)
+    table.cell(sigPanel, 1, 0, sigDir == 1 ? "BUY" : "SELL", text_color=color.white, bgcolor=color.new(sc,0), text_size=ts)
+    table.cell(sigPanel, 0, 1, "Entry", text_color=color.gray, text_size=ts)
+    table.cell(sigPanel, 1, 1, str.tostring(entryPrice, format.mintick), text_color=color.white, text_size=ts)
+    table.cell(sigPanel, 0, 2, "Stop", text_color=color.gray, text_size=ts)
+    table.cell(sigPanel, 1, 2, str.tostring(stopPrice, format.mintick), text_color=colBear, text_size=ts)
+    table.cell(sigPanel, 0, 3, "TP1", text_color=color.gray, text_size=ts)
+    table.cell(sigPanel, 1, 3, str.tostring(tp1, format.mintick), text_color=color.white, text_size=ts)
+    table.cell(sigPanel, 0, 4, "TP2", text_color=color.gray, text_size=ts)
+    table.cell(sigPanel, 1, 4, str.tostring(tp2, format.mintick), text_color=color.white, text_size=ts)
+    table.cell(sigPanel, 0, 5, "TP3", text_color=color.gray, text_size=ts)
+    table.cell(sigPanel, 1, 5, str.tostring(tp3, format.mintick), text_color=color.white, text_size=ts)
+    table.cell(sigPanel, 0, 6, "RR (target)", text_color=color.gray, text_size=ts)
+    table.cell(sigPanel, 1, 6, "1:" + str.tostring(rrTarget, "#.#"), text_color=color.white, text_size=ts)
+    table.cell(sigPanel, 0, 7, "Confluence", text_color=color.gray, text_size=ts)
+    table.cell(sigPanel, 1, 7, str.tostring(sigGradeScore) + " (" + sigGrade + ")", text_color=color.white, text_size=ts)
+    table.cell(sigPanel, 0, 8, "Draw on Liq", text_color=color.gray, text_size=ts)
+    table.cell(sigPanel, 1, 8, na(sigDOL) ? "—" : sigDOLlbl, text_color=color.white, text_size=ts)
+    table.cell(sigPanel, 0, 9, "Dist to Tgt", text_color=color.gray, text_size=ts)
+    table.cell(sigPanel, 1, 9, na(distToTargetTicks) ? "—" : str.tostring(distToTargetTicks, "#") + " tk", text_color=color.white, text_size=ts)
+
+// ============================================================================
+// SECTION 15 — ALERTS
+// ============================================================================
+
+alertcondition(alSweepEvt, title="Liquidity Sweep Detected", message="MDLE PRO: Liquidity Sweep detected on {{ticker}} {{interval}}")
+alertcondition(alDispEvt,  title="Displacement Confirmed",   message="MDLE PRO: Displacement confirmed on {{ticker}} {{interval}}")
+alertcondition(alOteEvt,   title="OTE Zone Entered",         message="MDLE PRO: Price entered OTE zone on {{ticker}} {{interval}}")
+alertcondition(buySignal,                                                  title="BUY Signal",              message="MDLE PRO: BUY signal on {{ticker}} {{interval}}")
+alertcondition(sellSignal,                                                 title="SELL Signal",             message="MDLE PRO: SELL signal on {{ticker}} {{interval}}")
+alertcondition(tp1Hit and not tp1Hit[1],                                   title="TP1 Hit",                 message="MDLE PRO: TP1 hit on {{ticker}} {{interval}}")
+alertcondition(tp2Hit and not tp2Hit[1],                                   title="TP2 Hit",                 message="MDLE PRO: TP2 hit on {{ticker}} {{interval}}")
+alertcondition(tp3Hit and not tp3Hit[1],                                   title="TP3 Hit",                 message="MDLE PRO: TP3 hit on {{ticker}} {{interval}}")
+alertcondition(deliveryDone,                                               title="Target Delivery Completed", message="MDLE PRO: Target delivery completed on {{ticker}} {{interval}}")
+alertcondition(stateChanged,                                               title="State Change",            message="MDLE PRO: State changed on {{ticker}} {{interval}}")
+
+// consume remaining one-shot flags
+oteFired := false
